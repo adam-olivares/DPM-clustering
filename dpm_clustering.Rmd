@@ -1,0 +1,316 @@
+---
+title: 'Bayesian Analysis: nonparametric approach to clustering'
+author: "Adam Olivares"
+date: "2025-05-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Simulate Data
+
+```{r}
+library(ggplot2)
+library(mvtnorm)
+library(nimble)
+library(mclust)
+library(ellipse)
+
+set.seed(123)
+
+# Parameters
+N <- 500        # sample size
+D <- 2          # number of covariates
+K <- 4          # real number of clusters
+
+# True parameters
+true_means <- matrix(c(-1.5, 1.5, 1.5, 1.5, -1.5, -1.5, 1.5, -1.5), nrow = K, byrow = TRUE)
+true_cov <- array(0, dim = c(2, 2, K))
+
+true_cov[, , 1] <- matrix(c(0.1, 0.03, 0.03, 0.1), nrow = 2)
+true_cov[, , 2] <- matrix(c(0.3, 0.05, 0.05, 0.3), nrow = 2)
+true_cov[, , 3] <- matrix(c(0.8, 0.5, 0.5, 0.8), nrow = 2)
+true_cov[, , 4] <- matrix(c(0.5, -0.08, -0.08, 0.5), nrow = 2)
+
+
+# Sample cluster assignments
+z <- sample(1:K, size = N, replace = TRUE)
+x <- matrix(0, nrow = N, ncol = D)
+for (i in 1:N) {
+  x[i, ] <- rmvnorm(1, mean = true_means[z[i], ], sigma = true_cov[, , z[i]])
+}
+
+
+# Plot using base R
+colors <- c("red", "blue", "forestgreen", "purple")
+plot(x, col = colors[z], pch = 19, asp = 1, xlab = "X1", ylab = "X2")
+
+# Add cluster means
+points(true_means, pch = 8, cex = 2, col = colors)
+# 95% confidence ellipses
+
+for (k in 1:K) {
+  lines(ellipse(true_cov[, , k], centre = true_means[k, ], level = 0.95), col = colors[k], lwd = 2)
+}
+```
+
+
+# Algorithm
+
+
+Stick-breaking construction
+
+```{r}
+# Define the number of clusters, data points and dimensionality of dataset
+N <- length(x[,1])
+D <- ncol(x)
+K <- 20  # Maximum possible number (NOT TRUNCATED)
+
+codeBNP_clust <- nimbleCode({
+  ## Mixture component parameters
+  for (n in 1:N) {
+    z[n] ~ dcat(w[1:K]) #sample categories based on weights for clustering stations (maximum as many clusters as observations)
+    x[n, 1:D] ~ dmnorm(mv.mu[z[n], 1:D], cov = covMat[z[n], 1:D, 1:D]) # Likelihood
+  }
+  # mv normal parameters
+  for (k in 1:K) {
+    mv.mu[k, 1:D] ~ dmnorm(mu0[1:D], cov = cov0[1:D, 1:D])
+    covMat[k, 1:D, 1:D] ~ dwish(S[1:D, 1:D], nu)
+    #invCov[k, 1:D, 1:D] <- inverse(covMat[k, 1:D, 1:D]) # if wishart
+  }
+  # Stick-Breaking process (Equivalent to Dirichlet generated weights)
+  for(i in 1:(K-1)) { # stick-breaking variables
+      v[i] ~ dbeta(1, alpha)
+    }
+    w[1:K] <- stick_breaking(v[1:(K-1)]) # stick-breaking weights
+  # Hyperpriors for DPM (Stick-Breaking construction)
+  alpha ~ dgamma(1, 1)
+
+})
+
+# Pack data in the format needed for compilation 
+constants <- list(
+  N = N, D = D, K = K,
+  #hyperparams,
+  mu0 = rep(0, D),
+  cov0 = diag(5, D),
+  S = diag(D), # p x p dimensional scale matrix
+  nu = D + 2 #df in wishart
+)
+
+data <- list(
+  x = x
+)
+
+covMat_init <- array(0, dim = c(K, D, D))  # K comes first
+for (k in 1:K) {
+  A <- matrix(rnorm(D^2), D, D)
+  covMat_init[k,,] <- crossprod(A) + diag(0.5, D)
+}
+
+#List with some initial values
+inits <- list(
+  alpha = 1,
+  v = rbeta(constants$K-1, 1, 1),
+  mv.mu = matrix(rnorm(K * D), nrow = K),
+  covMat = covMat_init,
+  z = sample(1:K, N, replace = TRUE)
+)
+
+```
+
+CRP construction
+
+```{r}
+# Define the number of clusters, data points and dimensionality of dataset
+N <- length(x[,1])
+D <- ncol(x)
+
+codeBNP_clust <- nimbleCode({
+  ## Mixture component parameters
+  for (n in 1:N) {
+    x[n, 1:D] ~ dmnorm(mv.mu[z[n], 1:D], cov = covMat[z[n], 1:D, 1:D]) # Likelihood
+  }
+  z[1:N] ~ dCRP(alpha, size = N) #sample categories based on CRP (maximum as many clusters as observations)
+  # mv normal parameters
+  for (k in 1:N) {
+    mv.mu[k, 1:D] ~ dmnorm(mu0[1:D], cov = cov0[1:D, 1:D])
+    covMat[k, 1:D, 1:D] ~ dwish(S[1:D, 1:D], nu)
+    #invCov[k, 1:D, 1:D] <- inverse(covMat[k, 1:D, 1:D]) # if wishart
+  }
+  # Hyperpriors for DPM (CRP construction)
+  alpha ~ dgamma(1, 1)
+})
+
+# Pack data in the format needed for compilation 
+constants <- list(
+  N = N, D = D,
+  #hyperparams,
+  mu0 = rep(0, D),
+  cov0 = diag(5, D),
+  S = diag(D), # p x p dimensional scale matrix
+  nu = D + 2 #df in wishart
+)
+
+data <- list(
+  x = x
+)
+
+covMat_init <- array(0, dim = c(N, D, D))  # K comes first
+for (k in 1:N) {
+  A <- matrix(rnorm(D), D, D) # add some random points
+  covMat_init[k,,] <- crossprod(A) + diag(0.5, D)
+}
+
+#List with some initial values
+inits <- list(
+  alpha = 1,
+  mv.mu = matrix(rnorm(N * D, 0, 10), nrow = N),
+  covMat = covMat_init,
+  z = sample(1:20, N, replace = TRUE)
+)
+
+```
+
+```{r}
+set.seed(1234)
+#MCMC
+model <- nimbleModel(code = codeBNP_clust, inits = inits, data = data,
+                          constants = constants)
+
+## Ensure we have the nodes needed to simulate new datasets
+dataNodes <- model$getNodeNames(dataOnly = TRUE)
+parentNodes <- model$getParents(dataNodes, stochOnly = TRUE)  
+## Ensure we have both data nodes and deterministic intermediates (e.g., lifted nodes)
+simNodes <- model$getDependencies(parentNodes, self = FALSE)
+
+cmodel <- compileNimble(model)
+mcmc    <- buildMCMC(model, monitors = c(parentNodes, "z"))
+cmcmc <- compileNimble(mcmc, project = model)
+iters <- 200000
+samplesBNP <- runMCMC(cmcmc, niter = iters, nburnin = iters/2 , nchains = 2, thin = 2)
+```
+
+```{r}
+library(MCMCvis) #same stan output format
+MCMCsummary(object = samplesBNP, round = 2)
+```
+
+```{r}
+MCMCsummary(object = samplesBNP, round = 2, params = "mv.mu")
+```
+
+```{r}
+MCMCsummary(object = samplesBNP, round = 2, params = "z")
+```
+
+
+```{r}
+# Extract z columns from each chain
+z_samples_list <- lapply(samplesBNP, function(chain) {
+  chain[, grep("^z\\[", colnames(chain))]
+})
+
+# Combine chains by row (iterations)
+z_samples_all <- do.call(rbind, z_samples_list)  # now all samples stacked together
+
+#compute mode
+posterior_mode_z <- apply(z_samples_all, 2, function(x) {
+  ux <- unique(x)
+  ux[which.max(tabulate(match(x, ux)))]
+})
+
+K_actual <- max(length(unique(posterior_mode_z)))
+K_actual
+```
+
+ARI DPM
+
+```{r}
+mclust::adjustedRandIndex(z, as.numeric(posterior_mode_z))
+table(z, posterior_mode_z)
+
+#table(z_samples_all[,1]) / nrow(z_samples_all) # posterior proba for obs 1
+```
+
+with GMM
+```{r}
+gmm_clust <- mclust::Mclust(x)$classification
+
+mclust::adjustedRandIndex(z,gmm_clust)
+
+table(z, gmm_clust)
+```
+
+
+```{r}
+# Combine chains if needed (assuming list)
+z_samples_list <- lapply(samplesBNP, function(chain) chain)
+samples_all <- do.call(rbind, z_samples_list)
+
+# Initialize list to store each mu vector (D x 1) per cluster
+post_mu_list <- vector("list", K_actual)
+
+# Fill in the list with posterior means
+for (k in 1:K_actual) {
+  temp <- unique(posterior_mode_z)[k]
+  mu_k <- numeric(D)
+  for (d in 1:D) {
+    colname <- paste0("mv.mu[", temp, ", ", d, "]")
+    if (colname %in% colnames(samples_all)) {
+      mu_k[d] <- mean(samples_all[, colname], na.rm = TRUE)
+    } else {
+      warning(paste("Missing column:", colname))
+    }
+  }
+  post_mu_list[[k]] <- matrix(mu_k, nrow = D, ncol = 1)  # ensure D x 1 matrix
+}
+
+# Optional: name the list elements
+names(post_mu_list) <- paste0("Cluster_", 1:K_actual)
+
+#############
+# Initialize list to store each covariance matrix (D x D) per cluster
+post_cov_list <- vector("list", K_actual)
+
+# Fill in the list with posterior covariances
+for (k in 1:K_actual) {
+  cov_k <- matrix(NA, nrow = D, ncol = D)
+  temp <- unique(posterior_mode_z)[k]
+  for (i in 1:D) {
+    for (j in 1:D) {
+      colname <- paste0("covMat[", temp, ", ", i, ", ", j, "]")
+      if (colname %in% colnames(samples_all)) {
+        cov_k[i, j] <- mean(samples_all[, colname], na.rm = TRUE)
+      } else {
+        warning(paste("Missing column:", colname))
+      }
+    }
+  }
+  post_cov_list[[k]] <- cov_k
+}
+
+# Optional: name the list elements
+names(post_cov_list) <- paste0("Cluster_", 1:K_actual)
+```
+
+```{r}
+new_labels <- as.numeric(factor(posterior_mode_z)) # Done for convenience when colouring
+colors <- rainbow(max(unique(new_labels)))
+cluster_colors <- colors[new_labels]
+
+plot(x, col = cluster_colors, pch = 19, asp = 1,
+     xlab = "X1", ylab = "X2", main = "Posterior Cluster Contours")
+
+for (k in 1:K_actual) {
+  temp <- unique(new_labels)[k]
+  lines(ellipse(post_cov_list[[k]][,], centre = post_mu_list[[k]][,], level = 0.95), col = colors[temp], lwd = 2)
+  points(post_mu_list[[k]][1,1], post_mu_list[[k]][2,1], pch = 4, col = "black", cex = 2, lwd = 2)
+}
+```
+
+
+
+
